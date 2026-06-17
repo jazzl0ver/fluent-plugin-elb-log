@@ -13,7 +13,7 @@ class Fluent::Plugin::Elb_LogInput < Fluent::Plugin::Input
   helpers :timer
 
   LOGFILE_REGEXP = /^((?<prefix>.+?)\/|)AWSLogs\/(?<account_id>[0-9]{12})\/elasticloadbalancing\/(?<region>.+?)\/(?<logfile_date>[0-9]{4}\/[0-9]{2}\/[0-9]{2})\/[0-9]{12}_elasticloadbalancing_.+?_(?<logfile_elb_name>[^_]+)_(?<logfile_timestamp>[0-9]{8}T[0-9]{4}Z)_(?<elb_ip_address>.+?)_(?<logfile_hash>.+)\.log(.gz)?$/
-  ACCESSLOG_REGEXP = /^((?<type>[a-z0-9]+) )?(?<time>\d{4}-\d{2}-\d{2}T\d{2}\:\d{2}\:\d{2}\.\d{6}Z) (?<elb>\S+) (?<client>\S+)\:(?<client_port>\S+) (?<target>[^:\s]+)(?::(?<target_port>\S+))? (?<request_processing_time>\S+) (?<target_processing_time>\S+) (?<response_processing_time>\S+) (?<elb_status_code>\S+) (?<target_status_code>\S+) (?<received_bytes>\S+) (?<sent_bytes>\S+) \"(?<request_method>\S+) (?<request_uri>\S+) (?<request_protocol>\S+)\" \"(?<user_agent>.*?)\" (?<ssl_cipher>\S+) (?<ssl_protocol>\S+) (?<target_group_arn>\S+) \"(?<trace_id>\S+)\" \"(?<domain_name>\S+)\" \"(?<chosen_cert_arn>\S+)\" (?<matched_rule_priority>\S+) (?<request_creation_time>\S+) \"(?<actions_executed>\S+)\" \"(?<redirect_url>\S+)\" \"(?<error_reason>\S+)\" \"(?<target_port_list>\S+)\" \"(?<target_status_code_list>\S+)\" \"(?<classification>\S+)\" \"(?<classification_reason>\S+)\" (?<conn_trace_id>\S+)/
+  ACCESSLOG_REGEXP = /^((?<type>[a-z0-9]+) )?(?<time>\d{4}-\d{2}-\d{2}T\d{2}\:\d{2}\:\d{2}\.\d{6}Z) (?<elb>\S+) (?<client>\S+)\:(?<client_port>\S+) (?<target>[^:\s]+)(?::(?<target_port>\S+))? (?<request_processing_time>\S+) (?<target_processing_time>\S+) (?<response_processing_time>\S+) (?<elb_status_code>\S+) (?<target_status_code>\S+) (?<received_bytes>\S+) (?<sent_bytes>\S+) \"(?<request_method>\S+) (?<request_uri>.*) (?<request_protocol>HTTP\/[0-9.]+|-)\" \"(?<user_agent>.*?)\" (?<ssl_cipher>\S+) (?<ssl_protocol>\S+) (?<target_group_arn>\S+) \"(?<trace_id>\S+)\" \"(?<domain_name>\S+)\" \"(?<chosen_cert_arn>\S+)\" (?<matched_rule_priority>\S+) (?<request_creation_time>\S+) \"(?<actions_executed>\S+)\" \"(?<redirect_url>\S+)\" \"(?<error_reason>\S+)\" \"(?<target_port_list>\S+)\" \"(?<target_status_code_list>\S+)\" \"(?<classification>\S+)\" \"(?<classification_reason>\S+)\" (?<conn_trace_id>\S+)/
   config_param :access_key_id, :string, default: nil, secret: true
   config_param :secret_access_key, :string, default: nil, secret: true
   config_param :region, :string
@@ -62,7 +62,7 @@ class Fluent::Plugin::Elb_LogInput < Fluent::Plugin::Input
 
     Signal.trap('INT') { shutdown }
 
-	refresh_aws_clients!
+    refresh_aws_clients!
 
     if @use_sqs
       input
@@ -77,7 +77,7 @@ class Fluent::Plugin::Elb_LogInput < Fluent::Plugin::Input
   def refresh_aws_clients!
     log.debug "Refreshing AWS credentials"
     @s3_client = s3_client
-    @sqs_client = sqs_client if @use_sqs    
+    @sqs_client = sqs_client if @use_sqs
   end
 
   def shutdown
@@ -101,7 +101,7 @@ class Fluent::Plugin::Elb_LogInput < Fluent::Plugin::Input
       return unless @running
       timer_execute(:in_elb_log, @refresh_interval) do
 	if @running
-		  refresh_aws_clients!
+	  refresh_aws_clients!
     	  process_sqs
     	  log.debug "sleeping for #{@refresh_interval}"
     	else
@@ -118,7 +118,7 @@ class Fluent::Plugin::Elb_LogInput < Fluent::Plugin::Input
     if @running
       timer_execute(:in_elb_log, @refresh_interval) do
 	if @running
-			refresh_aws_clients!
+	    refresh_aws_clients!
     	    input
 	    log.debug "sleeping input for #{@refresh_interval}"
 	end
