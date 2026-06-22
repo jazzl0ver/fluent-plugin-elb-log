@@ -85,6 +85,7 @@ To make it work, the following IAM policy should be attached to the instance IAM
                 "sqs:DeleteQueue",
                 "sqs:GetQueueAttributes",
                 "s3:ListBucket",
+                "s3:GetBucketNotification",
                 "s3:PutBucketNotification",
                 "sqs:CreateQueue"
             ],
