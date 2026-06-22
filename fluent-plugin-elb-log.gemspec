@@ -20,6 +20,8 @@ Gem::Specification.new do |spec|
   spec.add_dependency "fluentd", ">= 0.14.0", "< 2"
   spec.add_dependency "aws-sdk-s3", "~> 1"
   spec.add_dependency "aws-sdk-ec2", "~> 1"
+  spec.add_dependency "aws-sdk-sqs", "~> 1"
+  spec.add_dependency "aws-sdk-sts", "~> 1"
 
   spec.add_development_dependency "bundler", ">=1.17"
   spec.add_development_dependency "rake", "~> 12"

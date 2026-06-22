@@ -1,9 +1,11 @@
 require 'time'
 require 'zlib'
 require 'fileutils'
+require 'cgi'
 require 'aws-sdk-s3'
 require 'aws-sdk-ec2'
 require 'aws-sdk-sqs'
+require 'aws-sdk-sts'
 require 'fluent/input'
 require 'digest/sha1'
 
@@ -11,6 +13,8 @@ class Fluent::Plugin::Elb_LogInput < Fluent::Plugin::Input
   Fluent::Plugin.register_input('elb_log', self)
 
   helpers :timer
+
+  SQS_NOTIFICATION_ID = 'fluent-plugin-elb-log'
 
   LOGFILE_REGEXP = /^((?<prefix>.+?)\/|)AWSLogs\/(?<account_id>[0-9]{12})\/elasticloadbalancing\/(?<region>.+?)\/(?<logfile_date>[0-9]{4}\/[0-9]{2}\/[0-9]{2})\/[0-9]{12}_elasticloadbalancing_.+?_(?<logfile_elb_name>[^_]+)_(?<logfile_timestamp>[0-9]{8}T[0-9]{4}Z)_(?<elb_ip_address>.+?)_(?<logfile_hash>.+)\.log(.gz)?$/
   ACCESSLOG_REGEXP = /^((?<type>[a-z0-9]+) )?(?<time>\d{4}-\d{2}-\d{2}T\d{2}\:\d{2}\:\d{2}\.\d{6}Z) (?<elb>\S+) (?<client>\S+)\:(?<client_port>\S+) (?<target>[^:\s]+)(?::(?<target_port>\S+))? (?<request_processing_time>\S+) (?<target_processing_time>\S+) (?<response_processing_time>\S+) (?<elb_status_code>\S+) (?<target_status_code>\S+) (?<received_bytes>\S+) (?<sent_bytes>\S+) \"(?<request_method>\S+) (?<request_uri>.*) (?<request_protocol>HTTP\/[0-9.]+|-)\" \"(?<user_agent>.*?)\" (?<ssl_cipher>\S+) (?<ssl_protocol>\S+) (?<target_group_arn>\S+) \"(?<trace_id>\S+)\" \"(?<domain_name>\S+)\" \"(?<chosen_cert_arn>\S+)\" (?<matched_rule_priority>\S+) (?<request_creation_time>\S+) \"(?<actions_executed>\S+)\" \"(?<redirect_url>\S+)\" \"(?<error_reason>\S+)\" \"(?<target_port_list>\S+)\" \"(?<target_status_code_list>\S+)\" \"(?<classification>\S+)\" \"(?<classification_reason>\S+)\" (?<conn_trace_id>\S+)/
@@ -43,6 +47,7 @@ class Fluent::Plugin::Elb_LogInput < Fluent::Plugin::Input
     raise Fluent::ConfigError.new("timestamp_file is required") unless @timestamp_file
 
     @s3_client = s3_client
+    raise Fluent::ConfigError.new("AWS credentials are not available") unless @s3_client
     raise Fluent::ConfigError.new("s3 bucket not found #{@s3_bucketname}") unless s3bucket_is_ok?
   end
 
@@ -58,7 +63,7 @@ class Fluent::Plugin::Elb_LogInput < Fluent::Plugin::Input
     File.open(@timestamp_file, File::RDWR|File::CREAT).close
     File.open(@buf_file, File::RDWR|File::CREAT).close
 
-    @exclude_pattern_logfile_elb_name_re = Regexp.new(@exclude_pattern_logfile_elb_name)
+    @exclude_pattern_logfile_elb_name_re = Regexp.new(@exclude_pattern_logfile_elb_name) if @exclude_pattern_logfile_elb_name
 
     Signal.trap('INT') { shutdown }
 
@@ -76,8 +81,17 @@ class Fluent::Plugin::Elb_LogInput < Fluent::Plugin::Input
 
   def refresh_aws_clients!
     log.debug "Refreshing AWS credentials"
-    @s3_client = s3_client
-    @sqs_client = sqs_client if @use_sqs
+    new_s3_client = s3_client
+    new_sqs_client = @use_sqs ? sqs_client : nil
+
+    unless new_s3_client && (!@use_sqs || new_sqs_client)
+      log.warn "AWS credentials refresh skipped; keeping current clients"
+      return false
+    end
+
+    @s3_client = new_s3_client
+    @sqs_client = new_sqs_client if @use_sqs
+    true
   end
 
   def shutdown
@@ -128,8 +142,8 @@ class Fluent::Plugin::Elb_LogInput < Fluent::Plugin::Input
 
   def has_iam_role?
     begin
-      ec2 = Aws::EC2::Client.new(region: @region)
-      !ec2.config.credentials.nil?
+      ec2 = Aws::EC2::Client.new(aws_client_options)
+      aws_credentials_available?(ec2)
     rescue => e
       log.warn "EC2 Client error occurred: #{e.message}"
       @running = false
@@ -141,7 +155,9 @@ class Fluent::Plugin::Elb_LogInput < Fluent::Plugin::Input
     timestamp = Time.now.to_i
     queue_name = "fluent-plugin-elb-log-#{timestamp}"
 
-    sts_client = Aws::STS::Client.new(region: @region)
+    sts_client = sts_client()
+    return @running = false unless sts_client
+
     account_id = sts_client.get_caller_identity.account
 
     queue_policy = {
@@ -180,25 +196,7 @@ class Fluent::Plugin::Elb_LogInput < Fluent::Plugin::Input
     queue_arn = queue_attributes.attributes['QueueArn']
     log.debug "New SQS queue created: #{queue_arn}"
 
-    notification_configuration = {
-      queue_configurations: [
-	{
-	  id: "fluent-plugin-elb-log",
-          events: ['s3:ObjectCreated:*'],
-          queue_arn: "#{queue_arn}",
-          filter: {
-            key: {
-              filter_rules: [
-                {
-                  name: 'Prefix',
-                  value: "#{@s3_prefix}"
-                }
-              ]
-            }
-          }
-        }
-      ]
-    }
+    notification_configuration = s3_notification_configuration_with_queue(queue_arn)
 
     @s3_client.put_bucket_notification_configuration(
       bucket: @s3_bucketname,
@@ -212,24 +210,92 @@ class Fluent::Plugin::Elb_LogInput < Fluent::Plugin::Input
 
     rescue Aws::S3::Errors::InvalidArgument => e
       log.debug "S3 Event error: #{e.message}"
-      sqs_client.delete_queue(queue_url: @queue_url)
-      @queue_url = ""
-      log.debug "#{queue_arn} deleted"
+      if @sqs_client
+        @sqs_client.delete_queue(queue_url: @queue_url)
+        @queue_url = ""
+        log.debug "#{queue_arn} deleted"
+      end
+      @running = false
+
+    rescue Aws::Errors::MissingCredentialsError => e
+      log.warn "AWS credentials unavailable while setting up SQS: #{e.message}"
+      @running = false
+
+    rescue => e
+      log.warn "SQS setup error occurred: #{e.message}"
       @running = false
     end
   end
 
   def unset_sqs
     return if @queue_url.nil? || @queue_url == ""
-    @s3_client.put_bucket_notification_configuration(
-      bucket: @s3_bucketname,
-      notification_configuration: {}
-    )
-    log.debug "S3 notification events has been removed"
+    begin
+      notification_configuration = s3_notification_configuration_without_queue
 
-    @sqs_client.delete_queue(queue_url: @queue_url)
-    log.debug "SQS queue #{@queue_url} has been removed"
-    @queue_url = ""
+      @s3_client.put_bucket_notification_configuration(
+        bucket: @s3_bucketname,
+        notification_configuration: notification_configuration
+      )
+      log.debug "S3 notification events has been removed"
+
+      @sqs_client.delete_queue(queue_url: @queue_url)
+      log.debug "SQS queue #{@queue_url} has been removed"
+      @queue_url = ""
+    rescue Aws::Errors::MissingCredentialsError => e
+      log.warn "SQS cleanup skipped because AWS credentials are unavailable: #{e.message}"
+    rescue => e
+      log.warn "SQS cleanup error occurred: #{e.message}"
+    end
+  end
+
+  def current_s3_notification_configuration
+    @s3_client.get_bucket_notification_configuration(bucket: @s3_bucketname).to_h
+  end
+
+  def s3_notification_configuration_with_queue(queue_arn)
+    notification_configuration = current_s3_notification_configuration
+    queue_configurations = existing_s3_notification_queue_configurations(notification_configuration)
+
+    queue_configurations << {
+      id: SQS_NOTIFICATION_ID,
+      events: ['s3:ObjectCreated:*'],
+      queue_arn: queue_arn,
+      filter: {
+        key: {
+          filter_rules: [
+            {
+              name: 'Prefix',
+              value: "#{@s3_prefix}"
+            }
+          ]
+        }
+      }
+    }
+
+    notification_configuration[:queue_configurations] = queue_configurations
+    compact_s3_notification_configuration(notification_configuration)
+  end
+
+  def s3_notification_configuration_without_queue
+    notification_configuration = current_s3_notification_configuration
+    queue_configurations = existing_s3_notification_queue_configurations(notification_configuration)
+    notification_configuration[:queue_configurations] = queue_configurations
+    compact_s3_notification_configuration(notification_configuration)
+  end
+
+  def existing_s3_notification_queue_configurations(notification_configuration)
+    notification_configuration
+      .fetch(:queue_configurations, [])
+      .reject { |queue_configuration| queue_configuration[:id] == SQS_NOTIFICATION_ID }
+  end
+
+  def compact_s3_notification_configuration(notification_configuration)
+    notification_configuration.each_with_object({}) do |(key, value), compacted_configuration|
+      next if value.nil?
+      next if value.is_a?(Array) && value.empty?
+
+      compacted_configuration[key] = value
+    end
   end
 
   def get_timestamp_file
@@ -267,23 +333,7 @@ class Fluent::Plugin::Elb_LogInput < Fluent::Plugin::Input
   end
 
   def s3_client
-    begin
-      options = {
-        region: @region,
-      }
-      if @access_key_id && @secret_access_key
-        options[:access_key_id] = @access_key_id
-        options[:secret_access_key] = @secret_access_key
-      end
-      if @http_proxy
-        options[:http_proxy] = @http_proxy
-      end
-      log.debug "S3 client connect"
-      Aws::S3::Client.new(options)
-    rescue => e
-      log.warn "S3 Client error occurred: #{e.message}"
-      @running = false
-    end
+    build_aws_client(Aws::S3::Client, "S3")
   end
 
   def s3bucket_is_ok?
@@ -300,23 +350,52 @@ class Fluent::Plugin::Elb_LogInput < Fluent::Plugin::Input
   end
 
   def sqs_client
-    begin
-      options = {
-        region: @region,
-      }
-      if @access_key_id && @secret_access_key
-        options[:access_key_id] = @access_key_id
-        options[:secret_access_key] = @secret_access_key
-      end
-      if @http_proxy
-        options[:http_proxy] = @http_proxy
-      end
-      log.debug "SQS client connect"
-      Aws::SQS::Client.new(options)
-    rescue => e
-      log.warn "SQS Client error occurred: #{e.message}"
-      @running = false
+    build_aws_client(Aws::SQS::Client, "SQS")
+  end
+
+  def sts_client
+    build_aws_client(Aws::STS::Client, "STS")
+  end
+
+  def aws_client_options
+    options = {
+      region: @region,
+    }
+    if @access_key_id && @secret_access_key
+      options[:access_key_id] = @access_key_id
+      options[:secret_access_key] = @secret_access_key
     end
+    if @http_proxy
+      options[:http_proxy] = @http_proxy
+    end
+    options
+  end
+
+  def build_aws_client(client_class, service_name)
+    begin
+      log.debug "#{service_name} client connect"
+      client = client_class.new(aws_client_options)
+      unless aws_credentials_available?(client)
+        raise Aws::Errors::MissingCredentialsError, "unable to sign request without credentials set"
+      end
+      client
+    rescue Aws::Errors::MissingCredentialsError => e
+      log.warn "#{service_name} Client credentials unavailable: #{e.message}"
+      nil
+    rescue => e
+      log.warn "#{service_name} Client error occurred: #{e.message}"
+      nil
+    end
+  end
+
+  def aws_credentials_available?(client)
+    credentials = client.config.credentials
+    return false unless credentials
+
+    resolved_credentials = credentials.respond_to?(:credentials) ? credentials.credentials : credentials
+    resolved_credentials.respond_to?(:set?) && resolved_credentials.set?
+  rescue Aws::Errors::MissingCredentialsError
+    false
   end
 
   def input
@@ -353,6 +432,8 @@ class Fluent::Plugin::Elb_LogInput < Fluent::Plugin::Input
           delete_file_from_s3(object_key[:key])
         end
       end
+    rescue Aws::Errors::MissingCredentialsError => e
+      log.warn "AWS credentials unavailable while reading S3: #{e.message}"
     rescue => e
       log.warn "error occurred: #{e.message}"
       @running = false
@@ -389,42 +470,43 @@ class Fluent::Plugin::Elb_LogInput < Fluent::Plugin::Input
 	        next
 	      end
               #log.debug "S3 event: #{s3_event}"
-              bucket = s3_event['Records'][0]['s3']['bucket']['name']
-              key = s3_event['Records'][0]['s3']['object']['key']
-              event_time = Time.parse(s3_event['Records'][0]['eventTime']).to_i
-              log.debug "S3 event received for #{key} at #{s3_event['Records'][0]['eventTime']}"
+              s3_event['Records'].each do |record|
+                next unless record['s3']
 
-              object_key = get_object_key(key, event_time, 0)
-              if object_key.nil?
-        	@sqs_client.delete_message(
-                 queue_url: @queue_url,
-                 receipt_handle: message.receipt_handle
-	        )
-	        next
-	      end
+                bucket = record['s3']['bucket']['name']
+                next unless bucket == @s3_bucketname
 
-              record_common = {
-                "account_id" => object_key[:account_id],
-                "region" => object_key[:region],
-                "logfile_date" => object_key[:logfile_date],
-                "logfile_elb_name" => object_key[:logfile_elb_name],
-                "elb_ip_address" => object_key[:elb_ip_address],
-                "logfile_hash" => object_key[:logfile_hash],
-                "logfile_timestamp" => object_key[:logfile_timestamp],
-                "key" => object_key[:key],
-                "prefix" => object_key[:prefix],
-                "logfile_timestamp_unixtime" => object_key[:logfile_timestamp_unixtime],
-                "s3_last_modified_unixtime" => object_key[:s3_last_modified_unixtime],
-              }
+                key = CGI.unescape(record['s3']['object']['key'])
+                event_time = Time.parse(record['eventTime']).to_i
+                log.debug "S3 event received for #{key} at #{record['eventTime']}"
 
-              get_file_from_s3(object_key[:key])
-              emit_lines_from_buffer_file(record_common)
+                object_key = get_object_key(key, event_time, 0)
+                next if object_key.nil?
 
-              put_timestamp_file(object_key[:s3_last_modified_unixtime])
+                record_common = {
+                  "account_id" => object_key[:account_id],
+                  "region" => object_key[:region],
+                  "logfile_date" => object_key[:logfile_date],
+                  "logfile_elb_name" => object_key[:logfile_elb_name],
+                  "elb_ip_address" => object_key[:elb_ip_address],
+                  "logfile_hash" => object_key[:logfile_hash],
+                  "logfile_timestamp" => object_key[:logfile_timestamp],
+                  "key" => object_key[:key],
+                  "prefix" => object_key[:prefix],
+                  "logfile_timestamp_unixtime" => object_key[:logfile_timestamp_unixtime],
+                  "s3_last_modified_unixtime" => object_key[:s3_last_modified_unixtime],
+                }
 
-              if @delete
-                delete_file_from_s3(object_key[:key])
+                get_file_from_s3(object_key[:key])
+                emit_lines_from_buffer_file(record_common)
+
+                put_timestamp_file(object_key[:s3_last_modified_unixtime])
+
+                if @delete
+                  delete_file_from_s3(object_key[:key])
+                end
               end
+
 
               @sqs_client.delete_message(
                queue_url: @queue_url,
@@ -437,6 +519,8 @@ class Fluent::Plugin::Elb_LogInput < Fluent::Plugin::Input
     	    end
         end
       end
+      rescue Aws::Errors::MissingCredentialsError => e
+        log.warn "AWS credentials unavailable while reading SQS: #{e.message}"
       rescue => e
         log.warn "error occurred: #{e.message}"
         @running = false
@@ -470,8 +554,7 @@ class Fluent::Plugin::Elb_LogInput < Fluent::Plugin::Input
 
     s3_last_modified_unixtime = last_modified
     if s3_last_modified_unixtime > timestamp and matches
-      exclude_pattern_matches = @exclude_pattern_logfile_elb_name_re.match(matches[:logfile_elb_name])
-      if exclude_pattern_matches
+      if @exclude_pattern_logfile_elb_name_re && @exclude_pattern_logfile_elb_name_re.match(matches[:logfile_elb_name])
         log.debug "Skipping object #{key} b/c it matches exclude_pattern_logfile_elb_name"
         return nil
       end

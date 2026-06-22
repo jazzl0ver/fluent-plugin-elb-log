@@ -295,4 +295,77 @@ class Elb_LogInputTest < Test::Unit::TestCase
     assert_equal('"301"', m[:target_status_code_list])
     assert_equal(nil, m[:classification])
   end
+
+
+  class FakeLog
+    attr_reader :warns
+
+    def initialize
+      @warns = []
+    end
+
+    def debug(_message)
+    end
+
+    def info(_message)
+    end
+
+    def warn(message)
+      @warns << message
+    end
+  end
+
+  def bare_plugin
+    plugin = Fluent::Plugin::Elb_LogInput.allocate
+    fake_log = FakeLog.new
+    plugin.define_singleton_method(:log) { fake_log }
+    [plugin, fake_log]
+  end
+
+  def test_refresh_keeps_existing_clients_when_new_credentials_are_missing
+    plugin, = bare_plugin
+    old_s3_client = Object.new
+    old_sqs_client = Object.new
+    plugin.instance_variable_set(:@use_sqs, true)
+    plugin.instance_variable_set(:@s3_client, old_s3_client)
+    plugin.instance_variable_set(:@sqs_client, old_sqs_client)
+    plugin.define_singleton_method(:s3_client) { nil }
+    plugin.define_singleton_method(:sqs_client) { nil }
+
+    assert_equal(false, plugin.send(:refresh_aws_clients!))
+    assert_same(old_s3_client, plugin.instance_variable_get(:@s3_client))
+    assert_same(old_sqs_client, plugin.instance_variable_get(:@sqs_client))
+  end
+
+  def test_process_sqs_missing_credentials_keeps_running
+    plugin, fake_log = bare_plugin
+    sqs_client = Object.new
+    sqs_client.define_singleton_method(:get_queue_attributes) do |_params|
+      raise Aws::Errors::MissingCredentialsError, 'unable to sign request without credentials set'
+    end
+    plugin.instance_variable_set(:@running, true)
+    plugin.instance_variable_set(:@queue_url, 'queue-url')
+    plugin.instance_variable_set(:@sqs_client, sqs_client)
+
+    assert_nothing_raised { plugin.send(:process_sqs) }
+    assert_equal(true, plugin.instance_variable_get(:@running))
+    assert_match(/AWS credentials unavailable while reading SQS/, fake_log.warns.last)
+  end
+
+  def test_unset_sqs_missing_credentials_does_not_raise
+    plugin, fake_log = bare_plugin
+    s3_client = Object.new
+    s3_client.define_singleton_method(:put_bucket_notification_configuration) do |_params|
+      raise Aws::Errors::MissingCredentialsError, 'unable to sign request without credentials set'
+    end
+    plugin.instance_variable_set(:@s3_client, s3_client)
+    plugin.instance_variable_set(:@sqs_client, Object.new)
+    plugin.instance_variable_set(:@s3_bucketname, 'dummy-bucket')
+    plugin.instance_variable_set(:@queue_url, 'queue-url')
+
+    assert_nothing_raised { plugin.send(:unset_sqs) }
+    assert_equal('queue-url', plugin.instance_variable_get(:@queue_url))
+    assert_match(/SQS cleanup skipped because AWS credentials are unavailable/, fake_log.warns.last)
+  end
+
 end
